@@ -4,6 +4,9 @@ Four patches for CrossOver 26.3's Wine on Apple Silicon. They fix problems
 that only appear because Rosetta 2 translates the x86 code, mostly in 32-bit
 Windows programs.
 
+32-bit Windows programs run under Wine's WoW64 inside 64-bit processes, and
+Rosetta translates their 32-bit code.
+
 ## Origin
 
 The goal was to run Call of Duty: Black Ops II through the Plutonium client on
