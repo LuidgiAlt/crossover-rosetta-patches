@@ -1,0 +1,572 @@
+Subject: ntdll: emulate x86 execution breakpoints under Rosetta, with fast64
+Date: 2026-10-11
+Applies to: CrossOver 26.3.0 Wine sources (crossover-sources-26.3.0.tar.gz)
+Files changed: dlls/ntdll/unix/signal_x86_64.c
+Origin: ported by hand from wine-rosetta-fix (https://github.com/masonmcbride/wine-rosetta-fix,
+LGPL-2.1); fast64 and WINE_ROSETTA_STATS added in this project.
+Enabled by: WINE_ROSETTA_EXEC_BREAKPOINTS=1 (plus WINE_ROSETTA_WOW64_BREAKPOINTS=1,
+WINE_ROSETTA_CALL_WORKAROUND=1 for 32-bit programs)
+License: LGPL-2.1-or-later, like the Wine file it modifies.
+---
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 91926a8..26c0af7 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -89,6 +89,11 @@ static BOOL is_rosetta2;
+ static BOOL sequoia_or_later = FALSE;
+ #endif
+ 
++static BOOL emulate_rosetta_exec_breakpoints;
++static BOOL emulate_rosetta_wow64_breakpoints;
++static BOOL rosetta_call_workaround;
++static BOOL rosetta_fast64;
++
+ static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
+ static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
+ static USHORT ds64_sel;  /* selector for %ds/%es/%ss in 64-bit mode */
+@@ -508,6 +513,19 @@ struct amd64_thread_data
+     void                **instrumentation_callback; /* 0330 */
+     DWORD                 fs;            /* 0338 WOW TEB selector */
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
++#ifdef __APPLE__
++    BYTE                  emulated_step;
++    BYTE                  stopping_step;
++    BYTE                  resume_rf;
++    ULONG_PTR             rf_rip;
++    USHORT                rf_cs;
++    BYTE                  application_step;
++    BYTE                  dispatching_breakpoint;
++    BYTE                  steps64;       /* consecutive internal steps in 64-bit code */
++    ULONG_PTR             step_rip;
++    ULONG_PTR             step_rsp;
++    USHORT                step_cs;
++#endif
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+@@ -522,6 +540,132 @@ static inline struct amd64_thread_data *amd64_thread_data(void)
+     return (struct amd64_thread_data *)ntdll_get_thread_data()->cpu_data;
+ }
+ 
++/* Experimental, opt-in instruction stepping; never modifies executable bytes. */
++static BOOL rosetta_exec_breakpoints( struct amd64_thread_data *data )
++{
++#ifdef __APPLE__
++    unsigned int i;
++    if (!is_rosetta2 || !emulate_rosetta_exec_breakpoints) return FALSE;
++    if (is_wow64() && !emulate_rosetta_wow64_breakpoints) return FALSE;
++    for (i = 0; i < 4; i++)
++        if (((data->dr7 >> (2 * i)) & 3) && !((data->dr7 >> (16 + 4 * i)) & 15))
++            return TRUE;
++#endif
++    return FALSE;
++}
++
++
++struct xcontext;
++static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, struct xcontext *xcontext );
++
++static unsigned int rosetta_breakpoint_hits( struct amd64_thread_data *debug, ULONG_PTR pc, DWORD flags )
++{
++    ULONG_PTR addresses[4] = { debug->dr0, debug->dr1, debug->dr2, debug->dr3 };
++    unsigned int i, hits = 0;
++
++    if (flags & 0x10000) return 0;
++    for (i = 0; i < 4; i++)
++        if (((debug->dr7 >> (2 * i)) & 3) && !((debug->dr7 >> (16 + 4 * i)) & 15)
++            && addresses[i] == pc) hits |= 1 << i;
++    return hits;
++}
++
++static NTSTATUS rosetta_initial_breakpoint(void);
++
++#ifdef __APPLE__
++#include <mach/mach_time.h>
++/* Optional measurement (WINE_ROSETTA_STATS=1): once per second, report how many
++ * instructions were single-stepped and how many breakpoints were delivered.
++ * Uses only write(2) so it is safe inside the signal handler. */
++static BOOL rosetta_stats;
++static volatile LONG rosetta_steps, rosetta_hits, rosetta_threads_mask, rosetta_steps64;
++static UINT64 rosetta_stats_last;
++
++static char *rosetta_utoa( char *p, unsigned long v )
++{
++    char tmp[24]; int n = 0;
++    do tmp[n++] = '0' + v % 10; while ((v /= 10));
++    while (n) *p++ = tmp[--n];
++    return p;
++}
++
++static int rosetta_stats_level;
++static volatile LONG rosetta_steps_total, rosetta_steps64_total;
++
++static char *rosetta_hex( char *p, ULONG_PTR v )
++{
++    static const char digits[] = "0123456789abcdef";
++    char tmp[16]; int n = 0;
++    do tmp[n++] = digits[v & 15]; while ((v >>= 4));
++    *p++ = '0'; *p++ = 'x';
++    while (n) *p++ = tmp[--n];
++    return p;
++}
++
++/* WINE_ROSETTA_STATS=2: one line per breakpoint arm/hit, for working out
++ * which addresses and threads the emulation serves. Signal-safe. */
++static void rosetta_event( const char *kind, struct amd64_thread_data *d, ULONG_PTR pc, unsigned int cs )
++{
++    static mach_timebase_info_data_t tb;
++    static LONG last_total, last64;
++    char buf[256], *p = buf;
++    LONG total = rosetta_steps_total, total64 = rosetta_steps64_total;
++
++    if (rosetta_stats_level < 2) return;
++    if (!tb.denom) mach_timebase_info( &tb );
++    memcpy( p, "rosetta-ev: ", 12 ); p += 12;
++    while (*kind) *p++ = *kind++;
++    memcpy( p, " tid ", 5 ); p += 5;
++    p = rosetta_utoa( p, HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
++    memcpy( p, " pc ", 4 ); p += 4; p = rosetta_hex( p, pc );
++    memcpy( p, cs == cs32_sel ? " x86" : " x64", 4 ); p += 4;
++    memcpy( p, " dr7 ", 5 ); p += 5; p = rosetta_hex( p, d->dr7 );
++    memcpy( p, " dr0 ", 5 ); p += 5; p = rosetta_hex( p, d->dr0 );
++    memcpy( p, " dr1 ", 5 ); p += 5; p = rosetta_hex( p, d->dr1 );
++    memcpy( p, " dr2 ", 5 ); p += 5; p = rosetta_hex( p, d->dr2 );
++    memcpy( p, " dr3 ", 5 ); p += 5; p = rosetta_hex( p, d->dr3 );
++    memcpy( p, " steps ", 7 ); p += 7; p = rosetta_utoa( p, (unsigned long)(total - last_total) );
++    last_total = total;
++    memcpy( p, " (64-bit ", 9 ); p += 9; p = rosetta_utoa( p, (unsigned long)(total64 - last64) ); *p++ = ')';
++    last64 = total64;
++    *p++ = ' '; p = rosetta_utoa( p, (unsigned long)(mach_absolute_time() * tb.numer / tb.denom / 1000000) );
++    memcpy( p, "ms\n", 3 ); p += 3;
++    write( 2, buf, p - buf );
++}
++
++static void rosetta_stats_note( BOOL hit, BOOL in64 )
++{
++    static mach_timebase_info_data_t tb;
++    UINT64 now;
++    char buf[160], *p;
++
++    if (!rosetta_stats) return;
++    if (!hit) InterlockedIncrement( &rosetta_steps_total );
++    if (!hit && in64) { InterlockedIncrement( &rosetta_steps64 ); InterlockedIncrement( &rosetta_steps64_total ); }
++    if (hit) InterlockedIncrement( &rosetta_hits ); else InterlockedIncrement( &rosetta_steps );
++    InterlockedOr( &rosetta_threads_mask, 1 << (HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) % 31) );
++    if (!tb.denom) mach_timebase_info( &tb );
++    now = mach_absolute_time() * tb.numer / tb.denom;
++    if (now - rosetta_stats_last < 1000000000ull) return;
++    rosetta_stats_last = now;
++    p = buf;
++    memcpy( p, "rosetta-bp: pid ", 16 ); p += 16;
++    p = rosetta_utoa( p, getpid() );
++    memcpy( p, " steps/s ", 9 ); p += 9;
++    p = rosetta_utoa( p, InterlockedExchange( &rosetta_steps, 0 ) );
++    memcpy( p, " (64-bit ", 9 ); p += 9;
++    p = rosetta_utoa( p, InterlockedExchange( &rosetta_steps64, 0 ) );
++    *p++ = ')';
++    memcpy( p, " hits/s ", 8 ); p += 8;
++    p = rosetta_utoa( p, InterlockedExchange( &rosetta_hits, 0 ) );
++    memcpy( p, " threads ", 9 ); p += 9;
++    p = rosetta_utoa( p, __builtin_popcount( InterlockedExchange( &rosetta_threads_mask, 0 ) ) );
++    *p++ = ' '; p = rosetta_utoa( p, (unsigned long)(now / 1000000) );
++    memcpy( p, "ms\n", 3 ); p += 3;
++    write( 2, buf, p - buf );
++}
++#endif
++
+ static unsigned int frame_size;
+ static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
+ static UINT64 xstate_extended_features;
+@@ -984,6 +1128,10 @@ static void save_context( struct xcontext *xcontext, const ucontext_t *sigcontex
+     context->SegCs  = CS_sig(sigcontext);
+     context->SegFs  = FS_sig(sigcontext);
+     context->EFlags = EFL_sig(sigcontext);
++#ifdef __APPLE__
++    if (amd64_thread_data()->emulated_step && !amd64_thread_data()->application_step)
++        context->EFlags &= ~0x100;
++#endif
+     context->SegDs  = ds64_sel;
+     context->SegEs  = ds64_sel;
+     context->SegGs  = ds64_sel;
+@@ -1071,7 +1219,53 @@ static void restore_context( const struct xcontext *xcontext, ucontext_t *sigcon
+     amd64_thread_data()->dr6 = context->Dr6;
+     amd64_thread_data()->dr7 = context->Dr7;
+     set_sigcontext( context, sigcontext );
++#ifdef __APPLE__
++    if (is_rosetta2 && emulate_rosetta_exec_breakpoints)
++    {
++        struct amd64_thread_data *amd64_data = amd64_thread_data();
++        amd64_data->application_step = !!(context->EFlags & 0x100);
++        amd64_data->resume_rf = !!(context->EFlags & 0x10000);
++        amd64_data->rf_rip = context->Rip;
++        amd64_data->rf_cs = context->SegCs;
++        if (!amd64_data->emulated_step && rosetta_exec_breakpoints( amd64_data ))
++            rosetta_event( "arm-restore", amd64_data, context->Rip, context->SegCs );
++        amd64_data->emulated_step = rosetta_exec_breakpoints( amd64_data );
++        if (amd64_data->emulated_step) EFL_sig(sigcontext) |= 0x100;
++        amd64_data->step_rip = RIP_sig(sigcontext);
++        amd64_data->step_rsp = RSP_sig(sigcontext);
++        amd64_data->step_cs = CS_sig(sigcontext);
++    }
++#endif
+     if (FPU_sig(sigcontext)) memcpy( FPU_sig(sigcontext), &context->FltSave, sizeof(context->FltSave) );
++#ifdef __APPLE__
++    {
++        struct amd64_thread_data *amd64_data = amd64_thread_data();
++        if (amd64_data->emulated_step)
++        {
++            unsigned int hits = rosetta_breakpoint_hits( amd64_data, context->Rip, context->EFlags );
++            if (hits)
++            {
++                struct xcontext fault = *xcontext;
++                EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_SINGLE_STEP,
++                                         .ExceptionAddress = (void *)context->Rip };
++                CONTEXT regs;
++                BOOL self;
++
++                fault.c.Dr6 = amd64_data->dr6 = (amd64_data->dr6 & ~0x400f) | hits;
++                fault.c.EFlags |= 0x10000;
++                fault.c.EFlags &= ~0x100;
++                regs = fault.c;
++                regs.ContextFlags = CONTEXT_DEBUG_REGISTERS;
++                set_thread_context( GetCurrentThread(), &regs, &self, IMAGE_FILE_MACHINE_AMD64 );
++                amd64_data->emulated_step = FALSE;
++                rosetta_stats_note( TRUE, FALSE );
++                rosetta_event( "hit-resume", amd64_data, context->Rip, context->SegCs );
++                setup_raise_exception( sigcontext, &rec, &fault );
++                return;
++            }
++        }
++    }
++#endif
+     leave_handler( sigcontext );
+ }
+ 
+@@ -1206,8 +1400,29 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+         if (xs->CompactionMask) frame->xstate.Mask |= mask & ~xs->CompactionMask;
+     }
+ 
++#ifdef __APPLE__
++    if (is_rosetta2 && emulate_rosetta_exec_breakpoints && !is_wow64())
++    {
++        struct amd64_thread_data *amd64_data = amd64_thread_data();
++        if (flags & CONTEXT_CONTROL)
++        {
++            amd64_data->application_step = !!(context->EFlags & 0x100);
++            amd64_data->resume_rf = !!(context->EFlags & 0x10000);
++            amd64_data->rf_rip = frame->rip;
++            amd64_data->rf_cs = cs64_sel;
++        }
++        amd64_data->stopping_step = amd64_data->emulated_step &&
++                                    !rosetta_exec_breakpoints( amd64_data ) && !amd64_data->application_step;
++        if (!amd64_data->emulated_step && rosetta_exec_breakpoints( amd64_data ))
++            rosetta_event( "arm-set64", amd64_data, frame->rip, cs64_sel );
++        amd64_data->emulated_step = rosetta_exec_breakpoints( amd64_data );
++        if (amd64_data->emulated_step) frame->eflags |= 0x100;
++        else if (!amd64_data->application_step) frame->eflags &= ~0x100;
++        frame->restore_flags |= CONTEXT_CONTROL;
++    }
++#endif
+     frame->restore_flags |= flags & ~CONTEXT_INTEGER;
+-    return STATUS_SUCCESS;
++    return rosetta_initial_breakpoint();
+ }
+ 
+ 
+@@ -1254,6 +1469,10 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
+         context->Rsp    = frame->rsp;
+         context->Rip    = frame->rip;
+         context->EFlags = frame->eflags;
++#ifdef __APPLE__
++        if (amd64_thread_data()->emulated_step && !amd64_thread_data()->application_step)
++            context->EFlags &= ~0x100;
++#endif
+         context->SegCs  = cs64_sel;
+         context->SegSs  = ds64_sel;
+         context->ContextFlags |= CONTEXT_CONTROL;
+@@ -1349,6 +1568,51 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
+ }
+ 
+ 
++/* A TF trap occurs after an instruction. Check the resume PC separately so
++ * a breakpoint at the first instruction is not skipped. */
++static NTSTATUS rosetta_initial_breakpoint(void)
++{
++#ifdef __APPLE__
++    struct amd64_thread_data *debug = amd64_thread_data();
++    struct syscall_frame *frame = get_syscall_frame();
++    ULONG_PTR addresses[4];
++    unsigned int i, hits = 0;
++    CONTEXT context;
++    EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_SINGLE_STEP };
++    NTSTATUS status;
++
++    if (is_wow64() || !debug || debug->dispatching_breakpoint ||
++        !rosetta_exec_breakpoints( debug ) || (frame->eflags & 0x10000)) return STATUS_SUCCESS;
++    addresses[0] = debug->dr0;
++    addresses[1] = debug->dr1;
++    addresses[2] = debug->dr2;
++    addresses[3] = debug->dr3;
++    for (i = 0; i < 4; i++)
++        if (((debug->dr7 >> (2 * i)) & 3) && !((debug->dr7 >> (16 + 4 * i)) & 15)
++            && addresses[i] == frame->rip) hits |= 1 << i;
++    if (!hits) return STATUS_SUCCESS;
++
++    context.ContextFlags = CONTEXT_ALL;
++    if ((status = NtGetContextThread( GetCurrentThread(), &context ))) return status;
++    context.Dr6 = debug->dr6 = (debug->dr6 & ~0x400f) | hits;
++    context.EFlags |= 0x10000;
++    rec.ExceptionAddress = (void *)context.Rip;
++    {
++        CONTEXT regs = context;
++        BOOL self;
++        regs.ContextFlags = CONTEXT_DEBUG_REGISTERS;
++        if ((status = set_thread_context( GetCurrentThread(), &regs, &self, IMAGE_FILE_MACHINE_AMD64 ))) return status;
++    }
++    debug->dispatching_breakpoint = TRUE;
++    status = NtRaiseException( &rec, &context, TRUE );
++    debug->dispatching_breakpoint = FALSE;
++    return status;
++#else
++    return STATUS_SUCCESS;
++#endif
++}
++
++
+ /***********************************************************************
+  *              set_thread_wow64_context
+  */
+@@ -1392,7 +1656,11 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+             amd64_thread_data()->dr6 = context->Dr6;
+             amd64_thread_data()->dr7 = context->Dr7;
+         }
+-        if (!(flags & ~CONTEXT_I386_DEBUG_REGISTERS)) return ret;
++        if (!(flags & ~CONTEXT_I386_DEBUG_REGISTERS)
++#ifdef __APPLE__
++            && !(is_rosetta2 && emulate_rosetta_exec_breakpoints)
++#endif
++           ) return ret;
+     }
+ 
+     if (!(wow_frame = get_cpu_area( IMAGE_FILE_MACHINE_I386 ))) return STATUS_INVALID_PARAMETER;
+@@ -1456,6 +1724,42 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+         if (xs->CompactionMask) frame->xstate.Mask |= mask & ~xs->CompactionMask;
+         frame->restore_flags |= CONTEXT_XSTATE;
+     }
++#ifdef __APPLE__
++    if (is_rosetta2 && emulate_rosetta_exec_breakpoints)
++    {
++        struct amd64_thread_data *amd64_data = amd64_thread_data();
++        WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
++        if (flags & CONTEXT_I386_CONTROL)
++        {
++            amd64_data->application_step = !!(context->EFlags & 0x100);
++            amd64_data->resume_rf = !!(context->EFlags & 0x10000);
++            amd64_data->rf_rip = wow_frame->Eip;
++            amd64_data->rf_cs = cs32_sel;
++        }
++        amd64_data->stopping_step = amd64_data->emulated_step &&
++                                    !rosetta_exec_breakpoints( amd64_data ) && !amd64_data->application_step;
++        if (!amd64_data->emulated_step && rosetta_exec_breakpoints( amd64_data ))
++            rosetta_event( "arm-set32", amd64_data, wow_frame->Eip, cs32_sel );
++        amd64_data->emulated_step = rosetta_exec_breakpoints( amd64_data );
++        if (amd64_data->emulated_step) wow_frame->EFlags |= 0x100;
++        else if (!amd64_data->application_step) wow_frame->EFlags &= ~0x100;
++        if (amd64_data->stopping_step)
++        {
++            frame->eflags &= ~0x100;
++            frame->restore_flags |= CONTEXT_CONTROL;
++        }
++        if (amd64_data->emulated_step || amd64_data->stopping_step)
++        {
++            amd64_data->step_rip = wow_frame->Eip;
++            amd64_data->step_rsp = wow_frame->Esp;
++            amd64_data->step_cs = cs32_sel;
++            /* The fast WOW64 syscall entry does not refresh segment fields. */
++            wow_frame->SegSs = ds64_sel;
++            wow_frame->SegFs = amd64_data->fs;
++            cpu->Flags |= WOW64_CPURESERVED_FLAG_RESET_STATE;
++        }
++    }
++#endif
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1512,6 +1816,10 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+         context->Ebp    = wow_frame->Ebp;
+         context->Eip    = wow_frame->Eip;
+         context->EFlags = wow_frame->EFlags;
++#ifdef __APPLE__
++        if (amd64_thread_data()->emulated_step && !amd64_thread_data()->application_step)
++            context->EFlags &= ~0x100;
++#endif
+         context->SegCs  = LOWORD(wow_frame->SegCs);
+         context->SegSs  = LOWORD(wow_frame->SegSs);
+         context->ContextFlags |= CONTEXT_I386_CONTROL;
+@@ -2597,11 +2905,127 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     EXCEPTION_RECORD rec = { 0 };
+     struct xcontext context;
+ 
++#ifdef __APPLE__
++    {
++        struct amd64_thread_data *debug = amd64_thread_data();
++        if (debug->stopping_step && TRAP_sig(ucontext) == TRAP_x86_TRCTRAP)
++        {
++            debug->stopping_step = is_wow64() && CS_sig(ucontext) != cs32_sel;
++            EFL_sig(ucontext) &= ~0x100;
++            leave_handler( ucontext );
++            return;
++        }
++    }
++    /* The normal single-step shortcut cannot reconstruct a WOW64 transition
++     * halfway through its stack switch. Keep internal steps transparent. */
++    if (!(emulate_rosetta_exec_breakpoints && amd64_thread_data()->emulated_step
++          && TRAP_sig(ucontext) == TRAP_x86_TRCTRAP))
++#endif
+     if (handle_syscall_trap( ucontext, siginfo )) return;
+ 
+     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
++
++#ifdef __APPLE__
++    {
++        struct amd64_thread_data *debug = amd64_thread_data();
++        if (debug->emulated_step && TRAP_sig(ucontext) == TRAP_x86_TRCTRAP)
++        {
++            BYTE instr[5];
++            DWORD return_addr[2], displacement;
++
++            /* Separately gated workaround for the observed translated x86
++             * TF + E8 CALL stack anomaly. Require the complete instruction,
++             * previous PC/SP, destination and both return-address words. */
++            if (rosetta_call_workaround && CS_sig(ucontext) == cs32_sel && debug->step_cs == cs32_sel &&
++                debug->step_rsp == RSP_sig(ucontext) + 8 &&
++                virtual_uninterrupted_read_memory( (void *)debug->step_rip, instr, sizeof(instr) ) == sizeof(instr) &&
++                instr[0] == 0xe8 &&
++                virtual_uninterrupted_read_memory( (void *)RSP_sig(ucontext), return_addr, sizeof(return_addr) ) == sizeof(return_addr) &&
++                return_addr[0] == (DWORD)(debug->step_rip + 5) && !return_addr[1])
++            {
++                memcpy( &displacement, instr + 1, sizeof(displacement) );
++                if ((DWORD)(return_addr[0] + displacement) == (DWORD)RIP_sig(ucontext) &&
++                    !virtual_uninterrupted_write_memory( (void *)(RSP_sig(ucontext) + 4), return_addr, sizeof(DWORD) ))
++                    RSP_sig(ucontext) += 4;
++            }
++            if (debug->resume_rf && CS_sig(ucontext) == debug->rf_cs &&
++                debug->step_cs == debug->rf_cs) debug->resume_rf = FALSE;
++            debug->step_rip = RIP_sig(ucontext);
++            debug->step_rsp = RSP_sig(ucontext);
++            debug->step_cs = CS_sig(ucontext);
++        }
++    }
++#endif
+     save_context( &context, ucontext );
+ 
++#ifdef __APPLE__
++    {
++        struct amd64_thread_data *debug = amd64_thread_data();
++        if (debug->emulated_step && TRAP_sig(ucontext) == TRAP_x86_TRCTRAP)
++        {
++            ULONG_PTR addresses[4] = { debug->dr0, debug->dr1, debug->dr2, debug->dr3 };
++            unsigned int i, hits = 0;
++            for (i = 0; i < 4; i++)
++                if (((debug->dr7 >> (2 * i)) & 3) && !((debug->dr7 >> (16 + 4 * i)) & 15)
++                    && addresses[i] == RIP_sig(ucontext) && !(EFL_sig(ucontext) & 0x10000)
++                    && !(debug->resume_rf && debug->rf_cs == CS_sig(ucontext) &&
++                         debug->rf_rip == RIP_sig(ucontext)))
++                    hits |= 1 << i;
++            if (!hits && !debug->application_step)
++            {
++                rosetta_stats_note( FALSE, CS_sig(ucontext) != cs32_sel );
++                /* A WOW64 thread whose breakpoints are all 32-bit addresses
++                 * cannot hit one inside Wine's 64-bit code, yet stepping kept
++                 * going through the whole 32-to-64 syscall path (~80% of all
++                 * steps). Once safely past the point where syscall_32to64
++                 * saves the 32-bit flags, stop stepping and request the full
++                 * state restore so TF comes back on the first 32-bit
++                 * instruction after the call. */
++                if (rosetta_fast64 && is_wow64() && CS_sig(ucontext) != cs32_sel &&
++                    !((debug->dr0 | debug->dr1 | debug->dr2 | debug->dr3) >> 32))
++                {
++                    if (++debug->steps64 >= 16)
++                    {
++                        WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
++                        I386_CONTEXT *wow_frame = get_cpu_area( IMAGE_FILE_MACHINE_I386 );
++                        if (cpu && wow_frame)
++                        {
++                            debug->steps64 = 0;
++                            wow_frame->EFlags |= 0x100;
++                            cpu->Flags |= WOW64_CPURESERVED_FLAG_RESET_STATE;
++                            EFL_sig(ucontext) &= ~0x100;
++                            leave_handler( ucontext );
++                            return;
++                        }
++                    }
++                }
++                else debug->steps64 = 0;
++                EFL_sig(ucontext) |= 0x100;
++                leave_handler( ucontext );
++                return;
++            }
++            context.c.EFlags &= ~0x100;
++            context.c.Dr6 = debug->dr6 = (debug->dr6 & ~0x400f) | hits
++                                       | (debug->application_step ? 0x4000 : 0);
++            debug->emulated_step = FALSE;
++            if (hits) rosetta_stats_note( TRUE, FALSE );
++            rosetta_event( hits ? "hit" : "app-step", debug, RIP_sig(ucontext), CS_sig(ucontext) );
++            if (hits) context.c.EFlags |= 0x10000;  /* execution faults resume with RF set */
++            rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
++            {
++                CONTEXT regs = context.c;
++                BOOL self;
++                regs.ContextFlags = CONTEXT_DEBUG_REGISTERS;
++                set_thread_context( GetCurrentThread(), &regs, &self, IMAGE_FILE_MACHINE_AMD64 );
++            }
++            TRACE_(seh)( "emulated execution breakpoint rip=%p dr6=%lx\n",
++                         (void *)context.c.Rip, (unsigned long)context.c.Dr6 );
++            setup_raise_exception( ucontext, &rec, &context );
++            return;
++        }
++    }
++#endif
++
+     switch (TRAP_sig(ucontext))
+     {
+     case TRAP_x86_TRCTRAP:
+@@ -3010,6 +3434,17 @@ void signal_init_process(void)
+         else
+             is_rosetta2 = ret;
+     }
++    {
++        const char *option = getenv( "WINE_ROSETTA_EXEC_BREAKPOINTS" );
++        const char *wow_option = getenv( "WINE_ROSETTA_WOW64_BREAKPOINTS" );
++        const char *call_option = getenv( "WINE_ROSETTA_CALL_WORKAROUND" );
++        emulate_rosetta_exec_breakpoints = option && !strcmp( option, "1" );
++        emulate_rosetta_wow64_breakpoints = wow_option && !strcmp( wow_option, "1" );
++        rosetta_call_workaround = call_option && !strcmp( call_option, "1" );
++        rosetta_fast64 = !getenv( "WINE_ROSETTA_FAST64" ) || strcmp( getenv( "WINE_ROSETTA_FAST64" ), "0" );
++        rosetta_stats_level = getenv( "WINE_ROSETTA_STATS" ) ? atoi( getenv( "WINE_ROSETTA_STATS" ) ) : 0;
++        rosetta_stats = rosetta_stats_level >= 1;
++    }
+ 
+     /* CW Hack 23427: __builtin_available presumably isn't signal-safe. */
+     if (__builtin_available( macOS 15.0, * ))
+@@ -3123,10 +3558,20 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+     ctx = (CONTEXT *)((ULONG_PTR)context.Rsp & ~15) - 1;
+     *ctx = context;
+     ctx->ContextFlags = CONTEXT_FULL;
++#ifdef __APPLE__
++    if (is_rosetta2 && emulate_rosetta_exec_breakpoints)
++        ctx->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
++#endif
+     memset( &frame->xstate, 0, sizeof(frame->xstate) );
+     if (user_shared_data->XState.CompactionEnabled)
+         frame->xstate.CompactionMask = 0x8000000000000000 | user_shared_data->XState.EnabledFeatures;
++#ifdef __APPLE__
++    thread_data->dispatching_breakpoint = TRUE;
++#endif
+     signal_set_full_context( ctx );
++#ifdef __APPLE__
++    thread_data->dispatching_breakpoint = FALSE;
++#endif
+ 
+     frame->cs  = cs64_sel;
+     frame->ss  = ds64_sel;

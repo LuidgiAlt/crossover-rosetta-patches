@@ -1,0 +1,93 @@
+Subject: ntdll: under Rosetta, add PROT_EXEC lazily instead of forcing it when DEP is off
+Date: 2026-10-11
+Applies to: CrossOver 26.3.0 Wine sources (crossover-sources-26.3.0.tar.gz)
+Files changed: dlls/ntdll/unix/virtual.c
+Enabled by: WINE_ROSETTA_LAZY_EXEC=1
+License: LGPL-2.1-or-later, like the Wine file it modifies.
+---
+--- a/dlls/ntdll/unix/virtual.c	2026-10-11 17:59:14
++++ b/dlls/ntdll/unix/virtual.c	2026-10-11 17:59:35
+@@ -240,6 +240,25 @@
+ static void *preload_reserve_start;
+ static void *preload_reserve_end;
+ static BOOL force_exec_prot;  /* whether to force PROT_EXEC on all PROT_READ mmaps */
++#ifdef __APPLE__
++/* WINE_ROSETTA_LAZY_EXEC=1: when data execution prevention is turned off,
++ * add PROT_EXEC page by page on the first instruction fetch instead of
++ * mapping all readable memory executable. Under Rosetta every first write to
++ * a writable+executable page traps (see CW Hack 24945 below) and the fix-up
++ * runs under virtual_mutex, which stalled the whole process for seconds on
++ * GPU-shared upload memory. */
++static BOOL lazy_exec;
++static int lazy_exec_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        const char *env = getenv( "WINE_ROSETTA_LAZY_EXEC" );
++        enabled = env && atoi( env );
++    }
++    return enabled;
++}
++#endif
+ static BOOL enable_write_exceptions;  /* raise exception on writes to executable memory */
+ 
+ struct range_entry
+@@ -4554,11 +4573,43 @@
+     vprot = get_host_page_vprot( page );
+ 
+ #ifdef __APPLE__
++    if (lazy_exec && (get_unix_prot( vprot ) & PROT_READ) && !(get_unix_prot( vprot ) & PROT_EXEC))
++    {
++        /* Instruction fetch from a readable page with execution allowed for
++         * the process: make this host page executable and retry. Rosetta may
++         * report the fetch as a read fault, so also accept a read fault at
++         * the instruction pointer. */
++        ULONG_PTR pc = (ULONG_PTR)rec->ExceptionAddress;
++        if (err == EXCEPTION_EXECUTE_FAULT ||
++            (err == EXCEPTION_READ_FAULT && (ULONG_PTR)addr - pc < 16))
++        {
++            /* Same host-page granularity as mprotect_range(). */
++            if (!mprotect( page, host_page_size, get_unix_prot( vprot ) | PROT_EXEC ))
++            {
++                ret = STATUS_SUCCESS;
++                goto done;
++            }
++        }
++    }
++
+     /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
+     if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
+     {
+         WARN( "treating read fault in a readable page as a write fault, addr %p\n", addr );
+         err = EXCEPTION_WRITE_FAULT;
++    }
++
++    /* A write to a page we made executable on demand: drop PROT_EXEC again,
++     * restoring the protection the page should have; the next instruction
++     * fetch from it will add it back. */
++    if (lazy_exec && err == EXCEPTION_WRITE_FAULT &&
++        (get_unix_prot( vprot ) & PROT_WRITE) && !(get_unix_prot( vprot ) & PROT_EXEC))
++    {
++        if (!mprotect_range( page, host_page_size, 0, 0 ))
++        {
++            ret = STATUS_SUCCESS;
++            goto done;
++        }
+     }
+ 
+     /* CW Hack 24945 */
+@@ -4965,6 +5016,13 @@
+     struct file_view *view;
+     sigset_t sigset;
+ 
++#ifdef __APPLE__
++    if (lazy_exec_enabled())
++    {
++        lazy_exec = enable;
++        enable = FALSE;
++    }
++#endif
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     if (!force_exec_prot != !enable)  /* change all existing views */
+     {

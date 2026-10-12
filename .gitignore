@@ -1,0 +1,5 @@
+# Created by the rebuild steps in README.md
+/sources/
+/build/
+/crossover-sources-*.tar.gz
+.DS_Store
